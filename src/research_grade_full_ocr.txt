@@ -1,0 +1,180 @@
+# research_grade_full_ocr.py
+import os
+import cv2
+import json
+from pdf2image import convert_from_path
+from PIL import Image
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
+import torch
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from kraken import binarization, pageseg
+import numpy as np
+
+# --------------------------
+# GPU Setup
+# --------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+processor = TrOCRProcessor.from_pretrained("microsoft/trocr-large-handwritten")
+model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-large-handwritten").to(device)
+model.eval()
+
+# --------------------------
+# PDF → Images
+# --------------------------
+def pdf_to_images(pdf_path, dpi=400):
+    images = convert_from_path(pdf_path, dpi=dpi)
+    paths = []
+    for i, img in enumerate(images):
+        path = f"page_{i}.png"
+        img.save(path)
+        paths.append(path)
+    return paths
+
+# --------------------------
+# Preprocessing
+# --------------------------
+def preprocess(img_path):
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.fastNlMeansDenoising(img, None, 30, 7, 21)
+    img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 11, 2)
+    return img
+
+# --------------------------
+# Kraken Line Segmentation
+# --------------------------
+def segment_lines(img_path):
+    im = Image.open(img_path)
+    bw = binarization.nlbin(im)
+    seg = pageseg.segment(bw)
+    lines = []
+    for line in seg['lines']:
+        bbox = line['bbox']
+        crop = im.crop(bbox)
+        lines.append((bbox, crop))
+    return lines
+
+# --------------------------
+# Table detection (simple)
+# --------------------------
+def detect_table(block_img):
+    img = np.array(block_img)
+    # Heuristic: detect many horizontal & vertical lines
+    edges = cv2.Canny(img, 50, 150, apertureSize=3)
+    h_lines = cv2.reduce(edges, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32S)
+    v_lines = cv2.reduce(edges, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32S)
+    if h_lines.sum() > 1000 and v_lines.sum() > 1000:
+        return True
+    return False
+
+# --------------------------
+# TrOCR Recognition (batched)
+# --------------------------
+def recognize_lines_batch(line_imgs):
+    pixel_values = processor(images=line_imgs, return_tensors="pt", padding=True).pixel_values.to(device)
+    with torch.no_grad():
+        generated_ids = model.generate(pixel_values)
+    texts = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    return texts
+
+# --------------------------
+# Block processing (paragraphs or tables)
+# --------------------------
+def process_block(block_img, block_id):
+    if detect_table(block_img):
+        # Table: split into cells using simple grid
+        table = extract_table(block_img)
+        return {"block_id": block_id, "type": "table", "cells": table}
+    else:
+        # Paragraph
+        lines = segment_lines_from_image(block_img)
+        line_imgs = [crop for _, crop in lines]
+        texts = recognize_lines_batch(line_imgs)
+        line_results = []
+        for (bbox, _), text in zip(lines, texts):
+            line_results.append({"line_text": text, "bbox": bbox})
+        return {"block_id": block_id, "type": "paragraph", "lines": line_results}
+
+# --------------------------
+# Segment lines from already-cropped PIL Image
+# --------------------------
+def segment_lines_from_image(pil_img):
+    bw = binarization.nlbin(pil_img)
+    seg = pageseg.segment(bw)
+    lines = []
+    for line in seg['lines']:
+        bbox = line['bbox']
+        crop = pil_img.crop(bbox)
+        lines.append((bbox, crop))
+    return lines
+
+# --------------------------
+# Table extraction (grid heuristic)
+# --------------------------
+def extract_table(pil_img):
+    # Simple grid split: 3x3 example (can be improved)
+    width, height = pil_img.size
+    rows, cols = 3, 3
+    cell_w, cell_h = width // cols, height // rows
+    table_data = []
+    for r in range(rows):
+        row = []
+        for c in range(cols):
+            cell_crop = pil_img.crop((c*cell_w, r*cell_h, (c+1)*cell_w, (r+1)*cell_h))
+            text = recognize_lines_batch([cell_crop])[0]
+            row.append({"text": text})
+        table_data.append(row)
+    return table_data
+
+# --------------------------
+# Page processing
+# --------------------------
+def process_page(img_path, page_number):
+    pre_img = preprocess(img_path)
+    pil_img = Image.fromarray(pre_img)
+    
+    # Detect blocks using Kraken segmentation
+    bw = binarization.nlbin(pil_img)
+    seg = pageseg.segment(bw)
+    
+    blocks = []
+    for i, block in enumerate(seg['boxes']):
+        x0, y0, x1, y1 = block
+        block_crop = pil_img.crop((x0, y0, x1, y1))
+        block_data = process_block(block_crop, f"b{i}")
+        block_data["bbox"] = [x0, y0, x1, y1]
+        blocks.append(block_data)
+    
+    return {"page_number": page_number, "blocks": blocks}
+
+def process_page_wrapper(args):
+    return process_page(*args)
+
+# --------------------------
+# Parallel document processing
+# --------------------------
+def process_document_parallel(pdf_path):
+    image_paths = pdf_to_images(pdf_path)
+    tasks = [(img, i+1) for i, img in enumerate(image_paths)]
+    
+    pages = []
+    with Pool(cpu_count()) as pool:
+        for result in tqdm(pool.imap(process_page_wrapper, tasks), total=len(tasks)):
+            pages.append(result)
+    
+    doc_json = {"document_id": os.path.basename(pdf_path), "pages": pages}
+    
+    # Save JSON
+    out_path = pdf_path.replace(".pdf", "_full_ocr.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(doc_json, f, ensure_ascii=False, indent=2)
+    print(f"Saved JSON to {out_path}")
+    return doc_json
+
+# --------------------------
+# MAIN ENTRY
+# --------------------------
+if __name__ == "__main__":
+    pdf_file = "sample.pdf"  # <-- Replace with your PDF
+    process_document_parallel(pdf_file)
